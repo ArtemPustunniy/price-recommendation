@@ -40,18 +40,57 @@ reason (короткая понятная причина). Сохраните и
 """
 
 import asyncio
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
+
+OWN_SELLER = "myshop"
+MAX_DELIVERY_DAYS = 6
+COMPETITOR_FACTOR = Decimal("0.985")  # минус 1,5% от цены конкурента
+MAX_AUTO_CHANGE = Decimal("0.30")  # больше 30% — только после ручной проверки
+KOPECK = Decimal("0.01")
+
+
+def _decision(price, decision, reason):
+    return {"price": price, "decision": decision, "reason": reason}
+
+
+def _is_suitable(offer):
+    """Правило 2: доставка известна и не дольше 6 дней, продавец — не мы."""
+    days = offer["delivery_days"]
+    return (
+        days is not None
+        and days <= MAX_DELIVERY_DAYS
+        and offer["seller"].casefold() != OWN_SELLER
+    )
 
 
 async def recommend_price(fetch_offers, current_price, min_price, timeout_s=2.0):
-    result = await fetch_offers()
-    prices = [
-        float(offer["price"])
-        for offer in result["offers"]
-        if offer["delivery_days"] <= 6
-    ]
-    price = round(min(prices) * 0.985, 2)
-    return {"price": price, "decision": "APPLY", "reason": "Найдена минимальная цена"}
+    # Правило 1: ждём источник не дольше timeout_s, любой сбой — HOLD.
+    try:
+        result = await asyncio.wait_for(fetch_offers(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return _decision(current_price, "HOLD", f"Источник не ответил за {timeout_s:g} с")
+    except Exception as exc:
+        return _decision(current_price, "HOLD", f"Ошибка источника: {type(exc).__name__}")
+    if result["status"] != "success":
+        return _decision(current_price, "HOLD", f"Статус источника: {result['status']}")
+
+    # Правила 2–3: только подходящие предложения; нет их — HOLD без учёта min_price.
+    prices = [offer["price"] for offer in result["offers"] if _is_suitable(offer)]
+    if not prices:
+        return _decision(current_price, "HOLD", "Нет подходящих предложений конкурентов")
+
+    # Правило 4: минимальная цена конкурента −1,5%, вниз до копейки, не ниже min_price.
+    undercut = (min(prices) * COMPETITOR_FACTOR).quantize(KOPECK, rounding=ROUND_FLOOR)
+    price = max(undercut, min_price)
+    if price == undercut:
+        reason = "Минимальная цена конкурента −1,5%"
+    else:
+        reason = "Ограничено минимально допустимой ценой"
+
+    # Правило 5: изменение больше 30% в любую сторону — REVIEW, ровно 30% — APPLY.
+    if abs(price - current_price) > current_price * MAX_AUTO_CHANGE:
+        return _decision(price, "REVIEW", f"{reason}; изменение больше 30%, нужна ручная проверка")
+    return _decision(price, "APPLY", reason)
 
 
 async def sample_fetch_offers():
